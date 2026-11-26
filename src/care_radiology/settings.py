@@ -39,7 +39,6 @@ class PluginSettings:  # pragma: no cover
         self.import_strings = import_strings or set()
         self.required_settings = required_settings or set()
         self._cached_attrs = set()
-        self.validate()
 
     def __getattr__(self, attr) -> Any:
         if attr not in self.defaults:
@@ -48,7 +47,7 @@ class PluginSettings:  # pragma: no cover
         # Try to find the setting from user settings, then from environment variables
         val = self.defaults[attr]
         try:
-            val = self.user_settings[attr]
+            val = self._coerce(self.user_settings[attr], val)
         except KeyError:
             try:
                 val = env(attr, cast=type(val))
@@ -64,20 +63,43 @@ class PluginSettings:  # pragma: no cover
         setattr(self, attr, val)
         return val
 
+    @staticmethod
+    def _coerce(val: Any, default: Any) -> Any:
+        """
+        Parse a PLUGIN_CONFIGS value the same way an environment variable is parsed.
+
+        PLUGIN_CONFIGS entries are frequently built with a bare os.getenv(), so a
+        non-string setting arrives here as a string -- and bool("False") is True,
+        silently inverting every flag the deployment tried to turn off. Values that
+        already have the right type (or that the plugin declares as strings) pass
+        through untouched.
+
+        A None means the key was declared but never given a value (an unset
+        os.getenv()); treat that as absent via KeyError so the environment variable
+        and then the default still get their turn.
+        """
+        if val is None:
+            raise KeyError
+        if not isinstance(val, str) or isinstance(default, str) or default is None:
+            return val
+        try:
+            return env.parse_value(val, type(default))
+        except ValueError:
+            return val
+
     @property
     def user_settings(self) -> dict:
         if not hasattr(self, "_user_settings"):
-            self._user_settings = getattr(settings, "PLUGIN_CONFIGS", {}).get(
-                self.plugin_name, {}
-            )
+            self._user_settings = getattr(settings, "PLUGIN_CONFIGS", {}).get(self.plugin_name, {})
         return self._user_settings
 
     def validate(self) -> None:
         """
         This method handles the validation of the plugin settings.
+        It is called at app startup (apps.py ready()) to validate required settings.
         It could be overridden to provide custom validation logic.
 
-        the base implementation checks if all the required settings are truthy.
+        The base implementation checks if all the required settings are truthy.
         """
         for setting in self.required_settings:
             if not getattr(self, setting):
@@ -98,22 +120,49 @@ class PluginSettings:  # pragma: no cover
 
 
 REQUIRED_SETTINGS = {
-    "CARE_RADIOLOGY_DCM4CHEE_DICOMWEB_BASEURL",
-    "CARE_RADIOLOGY_WEBHOOK_SECRET"
+    "CARE_RADIOLOGY_DCM4CHEE_DICOMWEB_BASEURL",  # DCM4CHE DICOMweb base URL - required for PACS operations
+    "CARE_RADIOLOGY_WEBHOOK_SECRET",  # Secret key for webhook authentication - required for webhook endpoints
 }
 
 DEFAULTS = {
-    "CARE_RADIOLOGY_DCM4CHEE_DICOMWEB_BASEURL": "",
-    "CARE_RADIOLOGY_WEBHOOK_SECRET": ""
+    # ========================================================================
+    # Required Settings (validated at app startup, skipped during build commands)
+    # ========================================================================
+    "CARE_RADIOLOGY_DCM4CHEE_DICOMWEB_BASEURL": "",  # DCM4CHE DICOMweb base URL (e.g., http://arc:8080/dcm4chee-arc/aets/DCM4CHEE)
+    "CARE_RADIOLOGY_WEBHOOK_SECRET": "",  # Secret key for webhook authentication from DICOM modality worklist
+    # ========================================================================
+    # Optional Settings (has sensible defaults, can override if needed)
+    # ========================================================================
+    "CARE_RADIOLOGY_RADIOLOGY_CATEGORY": "imaging",  # Service request category for radiology procedures (default: "imaging")
+    # DICOM Validation Settings (enabled by default, can be disabled for testing/special cases)
+    # Reject a DICOM upload whose SOP Instance UID is already in the PACS (prevents re-uploading same file)
+    "CARE_RADIOLOGY_REJECT_DUPLICATE_SOP_INSTANCE": False,
+    # Reject a DICOM upload whose Accession Number is missing or does not match the service request
+    "CARE_RADIOLOGY_VALIDATE_ACCESSION_NUMBER": True,
+    # Reject linking a DICOM study to a service request when it is already linked to a different one (one study per SR)
+    "CARE_RADIOLOGY_UNIQUE_STUDY_PER_SR": True,
+    # PACS Server Timeout Configuration
+    "CARE_RADIOLOGY_PACS_CONNECT_TIMEOUT": 30,  # TCP connect timeout for all PACS operations (seconds)
+    "CARE_RADIOLOGY_PACS_UPLOAD_TIMEOUT": 600,  # Read timeout for STOW-RS uploads (seconds, 10 minutes)
+    "CARE_RADIOLOGY_PACS_QUERY_TIMEOUT": 60,  # Read timeout for QIDO-RS queries (seconds, 1 minute)
+    # Static API key rate limits (django-ratelimit rate strings, per source IP)
+    "CARE_RADIOLOGY_RATE_LIMIT_WEBHOOK_STATUS": "200/m",
+    "CARE_RADIOLOGY_RATE_LIMIT_DICOM_WORKLIST": "100/m",
+    "CARE_RADIOLOGY_RATE_LIMIT_DICOM_UPLOAD_EXTERNAL": "2000/m",
+    "CARE_RADIOLOGY_RATE_LIMIT_MODALITIES": "50/m",
+    # Auto-archive DICOM studies older than N days (by created_date). Disabled by default -
+    # nothing is archived automatically unless CARE_RADIOLOGY_STUDY_AUTO_ARCHIVE_ENABLED is set.
+    "CARE_RADIOLOGY_STUDY_AUTO_ARCHIVE_ENABLED": False,
+    "CARE_RADIOLOGY_STUDY_AUTO_ARCHIVE_DAYS": 365,
+    # Permanently delete a study's files from the PACS (and so from the PACS database)
+    "CARE_RADIOLOGY_DELETE_STUDY_FROM_PACS_ON_ARCHIVE": True,
 }
 
-plugin_settings = PluginSettings(
-    PLUGIN_NAME, defaults=DEFAULTS, required_settings=REQUIRED_SETTINGS
-)
+plugin_settings = PluginSettings(PLUGIN_NAME, defaults=DEFAULTS, required_settings=REQUIRED_SETTINGS)
 
 
 @receiver(setting_changed)
-def reload_plugin_settings(*args, **kwargs) -> None:
+def reload_plugin_settings(*_args, **kwargs) -> None:
     setting = kwargs["setting"]
     if setting == "PLUGIN_CONFIGS":
         plugin_settings.reload()
