@@ -7,4 +7,4 @@ class RadiologyWebhookLogs(EMRBaseModel):
     type = models.CharField(max_length=50)
 
     class Meta:
-        db_table = "radiology_webhook_logs"
+        ordering = ["-created_date", "-id"]

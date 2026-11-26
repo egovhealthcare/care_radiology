@@ -1,0 +1,1502 @@
+openapi: 3.0.3
+info:
+  title: Radiology Plugin API
+  description: |
+    API specification for the Radiology Plugin for CARE.
+
+    This plugin enables radiology workflows within CARE:
+    - Upload DICOM files and retrieve studies from DCM4CHEE
+    - Link DICOM studies to CARE service requests
+    - Serve a DICOM modality worklist and receive study/MPPS status webhooks from the
+      DICOM modality worklist server
+    - Manage per-facility observation templates used to structure diagnostic report
+      observations
+
+    **Care Plugin Conventions:**
+    - All `id` / `external_id` fields exposed via API are UUIDs (the table's `external_id`).
+      The internal BigInt PK is never exposed.
+    - All FK reference fields exposed via API are UUIDs (the referenced record's `external_id`).
+    - `created_by` / `updated_by` are nested user objects, not bare IDs.
+
+    **Authentication:**
+    - Standard CARE endpoints use JWT Bearer auth (Authorization: Bearer <token>).
+    - DICOM worklist and webhook endpoints use a static API key
+      (Authorization: <CARE_RADIOLOGY_WEBHOOK_SECRET>).
+
+  version: 1.0.0
+  contact:
+    name: Pranav Rustagi
+    email: pranav.rutagi@egovernments.org
+
+servers:
+  - url: https://care.ohc.network/
+    description: Dev server
+  - url: https://care-k3s.digit.org/
+    description: Egov server
+
+tags:
+  - name: DICOM Studies
+    description: Upload DICOM files and retrieve study metadata from DCM4CHEE
+  - name: Webhooks
+    description: Receive DICOM study and MPPS status notifications from the modality worklist server
+  - name: Observation Templates
+    description: Manage per-facility reusable observation templates used to structure diagnostic report observations
+  - name: Radiology Service Request
+    description: Read radiology-specific metadata (status, accession number) linked to a CARE service request
+
+security:
+  - BearerAuth: []
+
+paths:
+  # ---------- DICOM Studies ----------
+  /api/care_radiology/dicom/authenticate/:
+    get:
+      tags:
+        - DICOM Studies
+      summary: JWT authentication verification
+      description: |
+        Dummy endpoint called by the nginx auth_request proxy to validate the JWT before
+        forwarding DICOMweb requests to DCM4CHEE. Returns 200 if the token is valid.
+      operationId: dicomAuthenticate
+      responses:
+        '200':
+          description: Token is valid
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/care_radiology/dicom/worklist/:
+    get:
+      tags:
+        - DICOM Studies
+      summary: Get modality worklist
+      description: |
+        Returns active service requests formatted for a DICOM modality worklist.
+        Authenticated with static API key (Authorization: <CARE_RADIOLOGY_WEBHOOK_SECRET>).
+        Optionally filter by modality device name, date range, or facility.
+      operationId: dicomWorklist
+      security:
+        - StaticApiKey: []
+      parameters:
+        - name: modality
+          in: query
+          description: Filter by modality device registered_name (case-insensitive)
+          schema:
+            type: string
+            example: "CT"
+        - name: from
+          in: query
+          description: Start date filter (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+          schema:
+            type: string
+            example: "2026-06-01"
+        - name: to
+          in: query
+          description: End date filter (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+          schema:
+            type: string
+            example: "2026-06-12"
+        - name: facility
+          in: query
+          description: |
+            Facility external_id (UUID). Optional — when given, results are narrowed to
+            service requests belonging to that facility. When omitted, active service
+            requests across all facilities are returned.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Worklist results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "success"
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WorklistEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: The given facility does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "object_not_found"
+                    msg: "No Facility matches the given query."
+
+  /api/care_radiology/dicom/upload-dicom-external/:
+    post:
+      tags:
+        - DICOM Studies
+      summary: Upload DICOM file (external / static API key)
+      description: |
+        Upload a DICOM file for a patient using a static API key instead of user JWT auth.
+        Any filename is accepted here — see the `file` field. Intended for machine-to-machine use (e.g. modality worklist
+        server, HIS integration). The file is forwarded to DCM4CHEE and a `DicomStudy`
+        record is created or updated in CARE.
+
+        Authenticated with static API key (Authorization: <CARE_RADIOLOGY_WEBHOOK_SECRET>).
+        No user permission check is performed.
+      operationId: dicomUploadExternal
+      security:
+        - StaticApiKey: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - patient_id
+                - file
+              properties:
+                patient_id:
+                  type: string
+                  format: uuid
+                  description: Patient external_id
+                file:
+                  type: string
+                  format: binary
+                  description: |
+                    DICOM file. Any filename is accepted — validity is determined by DCM4CHEE, not
+                    by the extension.
+      responses:
+        '201':
+          description: DICOM file uploaded and study record created/updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "DICOM files uploaded to DCM4CHE successfully"
+                  study_uid:
+                    type: string
+                    description: DICOM Study Instance UID
+                    example: "1.2.840.10008.5.1.4.1.1.2.1234"
+                  study:
+                    $ref: '#/components/schemas/DicomStudyDetail'
+        '400':
+          description: |
+            No file or patient_id provided. The filename is deliberately not checked on this
+            endpoint — machine callers post parts named by SOP Instance UID — so unparseable
+            bytes surface as the 502 below, from DCM4CHEE.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "validation_error"
+                    msg:
+                      file: ["This value is required"]
+                      patient_id: ["This value is required"]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          description: DCM4CHEE upload failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "dicom_upload_error"
+                    msg: "Failed to upload to DCM4CHE"
+                    status_code: 503
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/care_radiology/dicom/upload/:
+    post:
+      tags:
+        - DICOM Studies
+      summary: Upload DICOM file
+      description: |
+        Upload a DICOM (.dcm) file for a patient. The file is forwarded to DCM4CHEE,
+        the study UID is extracted from the response, and a `DicomStudy` record is
+        created or updated in CARE. The study is then cached and returned.
+
+        Requires `can_write_patient_obj` permission on the patient and
+        `can_write_radiology_data` permission on the given facility.
+      operationId: dicomUpload
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - patient_id
+                - facility_id
+                - file
+              properties:
+                patient_id:
+                  type: string
+                  format: uuid
+                  description: Patient external_id
+                facility_id:
+                  type: string
+                  format: uuid
+                  description: Facility external_id — used to authorize this upload against radiology data permissions
+                file:
+                  type: string
+                  format: binary
+                  description: DICOM file. The filename must end in `.dcm` or `.dicom` (case-insensitive).
+      responses:
+        '201':
+          description: DICOM file uploaded and study record created/updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "DICOM files uploaded to DCM4CHE successfully"
+                  study_uid:
+                    type: string
+                    description: DICOM Study Instance UID
+                    example: "1.2.840.10008.5.1.4.1.1.2.1234"
+                  study:
+                    $ref: '#/components/schemas/DicomStudyDetail'
+        '400':
+          description: No file, patient_id, or facility_id provided, or file is not a `.dcm` / `.dicom`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                missing_fields:
+                  value:
+                    errors:
+                      - type: "validation_error"
+                        msg:
+                          file: ["This value is required"]
+                          facility_id: ["This value is required"]
+                          patient_id: ["This value is required"]
+                bad_extension:
+                  value:
+                    errors:
+                      - type: "validation_error"
+                        msg:
+                          file: ["Only .dcm and .dicom files are supported"]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          description: DCM4CHEE upload failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "dicom_upload_error"
+                    msg: "Failed to upload to DCM4CHE"
+                    status_code: 503
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/care_radiology/dicom/link-service-request/:
+    post:
+      tags:
+        - DICOM Studies
+      summary: Link an uploaded study to a service request
+      description: |
+        Links an already-uploaded DICOM study to a CARE `ServiceRequest`. Called once
+        all files for a study have finished uploading via `upload` / `upload-dicom-external`.
+
+        Requires `can_write_service_request` permission on the service request, and
+        `can_write_radiology_data` permission on the service request's facility.
+      operationId: dicomLinkServiceRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - service_request_id
+                - study_uid
+              properties:
+                service_request_id:
+                  type: string
+                  format: uuid
+                  description: ServiceRequest external_id
+                study_uid:
+                  type: string
+                  description: DICOM Study Instance UID
+      responses:
+        '200':
+          description: Service request linked to study successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+                    example: "Service request linked to study successfully"
+                  record:
+                    type: object
+                    properties:
+                      external_id:
+                        type: string
+                        format: uuid
+                        description: RadiologyServiceRequest external_id
+                      data:
+                        type: object
+                        description: Raw payload stored on the link record
+        '400':
+          description: |
+            Payload failed validation against `DicomStudyLinkSpec` — missing field, malformed
+            `service_request_id` UUID, or empty `study_uid`. One entry per offending field.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "missing"
+                    loc: ["study_uid"]
+                    msg: "Field required"
+                  - type: "uuid_parsing"
+                    loc: ["service_request_id"]
+                    msg: "Input should be a valid UUID"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The given `study_uid` is already linked to a different service request's
+            `RadiologyServiceRequest` (each study belongs to exactly one).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                detail: "Study is already linked to a different service request"
+
+  /api/care_radiology/dicom/studies/:
+    get:
+      tags:
+        - DICOM Studies
+      summary: Get DICOM studies for an encounter or a service request
+      description: |
+        Returns all DICOM studies linked to the given scope, fetching live metadata (study
+        date, description, modalities, series) from DCM4CHEE in parallel threads. Studies not
+        found in DCM4CHEE are omitted from the response.
+
+        At least one of `encounterId` or `serviceRequestId` must be provided; if both are
+        given, `serviceRequestId` wins and `encounterId` is ignored.
+
+        If `encounterId` is given: requires `can_view_encounter_obj` permission on the
+        encounter, plus `can_read_radiology_data` permission on the encounter's facility. Only
+        studies whose linked `ServiceRequest.status` is `active` are returned in this case.
+        If `serviceRequestId` is given: requires `can_read_service_request` permission on the
+        service request, plus `can_read_radiology_data` permission on its facility. All studies
+        linked to that service request are returned regardless of its status.
+
+        Each study includes a `service_request` block (`id` and `diagnostic_report_id`, the
+        latter being the most recently created `DiagnosticReport` for that service request, or
+        `null` if none exists yet) — `null` if the study isn't linked to a service request. A
+        caller that needs further service-request detail (e.g. its `title`) should fetch it
+        separately via the core CARE
+        `GET /api/v1/facility/{facilityId}/service_request/{serviceRequestId}/` endpoint.
+
+        Note: a previous `patientId` query param was removed — `Patient` has no single
+        owning facility to gate `can_read_radiology_data` against, so patient-scoped
+        lookups are not supported on this endpoint. This endpoint also supersedes the former
+        `GET /dicom/service-requests/`, which has been removed.
+      operationId: dicomGetStudies
+      parameters:
+        - name: encounterId
+          in: query
+          description: Encounter external_id (UUID). Required if serviceRequestId is not given.
+          schema:
+            type: string
+            format: uuid
+        - name: serviceRequestId
+          in: query
+          description: ServiceRequest external_id (UUID). Takes priority over encounterId if both are given.
+          schema:
+            type: string
+            format: uuid
+        - name: includeArchived
+          in: query
+          description: |
+            When `true`, archived studies (`is_archived=true`) are included in the results.
+            Defaults to `false` — archived studies are hidden unless explicitly requested.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: List of DICOM studies with live DCM4CHEE metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DicomStudyDetail'
+        '400':
+          description: |
+            Query failed validation against `DicomStudiesQuerySpec` — neither id given, or one of
+            them is not a valid UUID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "value_error"
+                    msg: "Value error, Either encounterId or serviceRequestId is required"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/care_radiology/dicom/{id}/archive/:
+    post:
+      tags:
+        - DICOM Studies
+      summary: Archive a DICOM study
+      description: |
+        Soft-hides a `DicomStudy` by setting `is_archived=true` along with `archive_reason`,
+        `archived_datetime`, and `archived_by`. The row is never deleted — it is simply
+        excluded from `GET /dicom/studies/` results unless `includeArchived=true` is passed.
+        Mirrors the archive pattern used by `FileUpload` and `ReportUpload` elsewhere in CARE.
+
+        The study must already be linked to a service request (via `link-service-request`) —
+        archiving is rejected otherwise, since authorization is resolved through
+        `radiology_service_request.service_request.facility`. Requires
+        `can_write_radiology_data` permission on that facility.
+
+        There is no unarchive endpoint, matching the reference `FileUpload`/`ReportUpload`
+        archive actions.
+      operationId: archiveDicomStudy
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DicomStudyArchiveRequest'
+            example:
+              archive_reason: "Duplicate upload, superseded by a later study"
+      responses:
+        '200':
+          description: Study archived
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DicomStudyArchiveState'
+        '400':
+          description: |
+            Payload failed validation against `DicomStudyArchiveSpec` (missing/empty
+            `archive_reason`), or the study is not linked to a service request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                missing_reason:
+                  value:
+                    errors:
+                      - type: "missing"
+                        loc: ["archive_reason"]
+                        msg: "Field required"
+                not_linked:
+                  value:
+                    errors:
+                      - type: "validation_error"
+                        msg:
+                          detail: "Cannot archive a study that is not linked to a service request"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------- Webhooks ----------
+  /api/care_radiology/webhooks/study/:
+    post:
+      tags:
+        - Webhooks
+      summary: Receive DICOM study notification
+      description: |
+        Webhook endpoint called by the DICOM worklist server when a study is completed
+        or linked to a service request. Authenticated with static API key.
+
+        Three payload shapes are supported, tried in priority order:
+
+        **Shape A — service_request_id + study_id:**
+        Links the study to an existing CARE `ServiceRequest` looked up by `service_request_id`
+        (external_id).
+
+        **Shape B — accession_number + study_id:**
+        Links the study to a `ServiceRequest` looked up via `RadiologyServiceRequest.accession_number`
+        (also mirrored onto `ServiceRequest.meta.accession_number`).
+
+        **Shape C — patient_id + study_id:**
+        Links the study directly to a patient identified by their instance identifier
+        (e.g. HIS patient ID stored in `instance_identifiers`), without a service request link.
+
+        All payloads are persisted to `RadiologyWebhookLogs` regardless of shape.
+      operationId: webhookStudy
+      security:
+        - StaticApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookStudyPayload'
+            examples:
+              service_request_study:
+                summary: Shape A — link study to service request
+                value:
+                  service_request_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+                  study_id: "1.2.840.10008.5.1.4.1.1.2.1234567890"
+              accession_number_study:
+                summary: Shape B — link study via accession number
+                value:
+                  accession_number: "ACJAYCTO26000004"
+                  study_id: "1.2.840.10008.5.1.4.1.1.2.1234567890"
+              patient_study:
+                summary: Shape C — link study to patient
+                value:
+                  patient_id: "PID-00123"
+                  study_id: "1.2.840.10008.5.1.4.1.1.2.0987654321"
+      responses:
+        '200':
+          description: Webhook received and processed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookStudyResponse'
+        '400':
+          description: |
+            Payload failed validation against `WebhookStudySpec` — missing `study_id`, or none
+            of `service_request_id` / `accession_number` / `patient_id` given. A malformed JSON
+            body (unparseable syntax) instead returns DRF's default `{"detail": ...}` shape —
+            see the `Error` schema.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                missing_study_id:
+                  value:
+                    errors:
+                      - type: "missing"
+                        loc: ["study_id"]
+                        msg: "Field required"
+                missing_lookup_identifier:
+                  value:
+                    errors:
+                      - type: "value_error"
+                        msg: "Value error, One of service_request_id, accession_number or patient_id is required"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: |
+            Referenced service request or patient not found in CARE, or the `study_id` is
+            already linked to a different service request's `RadiologyServiceRequest`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                no_service_request:
+                  value:
+                    detail: "No matching service request"
+                no_patient:
+                  value:
+                    detail: "No matching patient"
+                study_conflict:
+                  value:
+                    detail: "Study is already linked to a different service request"
+
+  /api/care_radiology/webhooks/status/:
+    post:
+      tags:
+        - Webhooks
+      summary: Receive MPPS status update
+      description: |
+        Webhook endpoint called by the DICOM worklist server with Modality Performed
+        Procedure Step (MPPS) status updates. Maps `study_status` to a facility
+        `TagConfig` entry and appends it to `ServiceRequest.tags` (duplicates are
+        skipped). Authenticated with static API key. All payloads are persisted to
+        `RadiologyWebhookLogs` with `type="MPPS"`.
+
+        `study_status` is expected to be one of `SCAN_STARTED`, `SCAN_COMPLETED`,
+        `DISCONTINUED` (an unrecognized value is still processed, just logged as a
+        warning) and must match a `TagConfig.display` value configured for the
+        service request's facility.
+      operationId: webhookStatus
+      security:
+        - StaticApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookStatusPayload'
+            example:
+              service_request_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+              study_status: "SCAN_STARTED"
+      responses:
+        '200':
+          description: Tag updated successfully, or already present
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookStatusResponse'
+        '400':
+          description: |
+            Payload failed validation against `WebhookMppsSpec` (missing/invalid
+            `service_request_id` or `study_status`), or a business rule failed: the service
+            request's facility is missing, or no `TagConfig.display` matches `study_status`
+            for that facility.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                missing_fields:
+                  value:
+                    errors:
+                      - type: "missing"
+                        loc: ["study_status"]
+                        msg: "Field required"
+                tag_not_found:
+                  value:
+                    errors:
+                      - type: "validation_error"
+                        msg:
+                          study_status: "Tag configuration not found for status: SCAN_STARTED"
+                facility_not_found:
+                  value:
+                    errors:
+                      - type: "validation_error"
+                        msg:
+                          service_request_id: "Facility not found for service request"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: ServiceRequest not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "object_not_found"
+                    msg: "No ServiceRequest matches the given query."
+        '500':
+          description: |
+            Unexpected database error while fetching the tag configuration or saving the
+            updated `ServiceRequest.tags`. Raised as a plain DRF `APIException`, so this uses
+            the `Error` schema, not `ErrorEnvelope`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                detail: "Error updating tags"
+
+  # ---------- Radiology Service Request ----------
+  /api/care_radiology/radiology_service_request/{serviceRequestId}/:
+    get:
+      tags:
+        - Radiology Service Request
+      summary: Get radiology metadata for a service request
+      description: |
+        Returns the `RadiologyServiceRequest` (status and accession number) linked to a CARE
+        `ServiceRequest`, looked up by the service request's own `external_id` — not the
+        `RadiologyServiceRequest`'s own `id`.
+
+        Requires `can_read_service_request` permission on the service request, plus
+        `can_read_radiology_data` permission on its facility.
+      operationId: getRadiologyServiceRequest
+      parameters:
+        - name: serviceRequestId
+          in: path
+          required: true
+          description: ServiceRequest external_id (UUID)
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Radiology service request metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RadiologyServiceRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No service request with this external_id, or it has no linked RadiologyServiceRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "object_not_found"
+                    msg: "No RadiologyServiceRequest matches the given query."
+
+  # ---------- Observation Templates ----------
+  /api/care_radiology/observation_template/:
+    get:
+      tags:
+        - Observation Templates
+      summary: List observation templates
+      description: |
+        Returns observation templates for a facility. `facility` is required.
+        Optionally filter by `observation_definition`, `activity_definition`,
+        or `title` (case-insensitive contains).
+
+        Requires `can_read_radiology_observation_template` permission for the facility (shares the same permission slug as core diagnostic reports).
+      operationId: listObservationTemplates
+      parameters:
+        - name: facility
+          in: query
+          required: true
+          description: Facility external_id (UUID)
+          schema:
+            type: string
+            format: uuid
+        - name: observation_definition
+          in: query
+          description: Filter by ObservationDefinition external_id
+          schema:
+            type: string
+            format: uuid
+        - name: activity_definition
+          in: query
+          description: Filter by ActivityDefinition external_id
+          schema:
+            type: string
+            format: uuid
+        - name: title
+          in: query
+          description: Case-insensitive substring match on title
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Ordering'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Paginated list of observation templates
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservationTemplateList'
+        '400':
+          description: facility query parameter is required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "validation_error"
+                    msg:
+                      facility: ["This value is required"]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags:
+        - Observation Templates
+      summary: Create observation template
+      description: |
+        Creates a new observation template for a facility, with a set of fields
+        (code/value/description) replacing any existing fields. `title` must be
+        unique per facility.
+
+        Requires `can_write_radiology_observation_template` permission for the facility (shares the same permission slug as core diagnostic reports).
+      operationId: createObservationTemplate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ObservationTemplateCreate'
+            example:
+              facility: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+              observation_definition: "9c0d11ee-aabb-44cc-aa11-bb22cc33dd44"
+              activity_definition: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              title: "Chest X-Ray Findings"
+              description: "Standard structured findings for chest X-Ray"
+              fields:
+                - code: "impression"
+                  value: null
+                  description: "Radiologist impression"
+      responses:
+        '201':
+          description: Observation template created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservationTemplate'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/care_radiology/observation_template/{id}/:
+    get:
+      tags:
+        - Observation Templates
+      summary: Retrieve observation template
+      operationId: getObservationTemplate
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Observation template detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservationTemplate'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags:
+        - Observation Templates
+      summary: Update observation template
+      description: |
+        Partially updates `title` and/or `description` of an existing observation
+        template. Fields (code/value/description) cannot be changed via update.
+
+        Requires `can_write_radiology_observation_template` permission for the facility (shares the same permission slug as core diagnostic reports).
+      operationId: updateObservationTemplate
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ObservationTemplateUpdate'
+      responses:
+        '200':
+          description: Observation template updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservationTemplate'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          description: |
+            Validation failed, including a duplicate `title` for the facility — `perform_update`
+            catches the `IntegrityError` and re-raises it as a field error, so this is a 400 and
+            not a 409.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                errors:
+                  - type: "validation_error"
+                    msg:
+                      title: ["A template with this title already exists for this facility"]
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Standard CARE JWT token
+    StaticApiKey:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Static API key (CARE_RADIOLOGY_WEBHOOK_SECRET setting value)
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      description: Resource external_id (UUID)
+      schema:
+        type: string
+        format: uuid
+    Page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      name: page_size
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Ordering:
+      name: ordering
+      in: query
+      description: Order results by field (prefix with - for descending)
+      schema:
+        type: string
+        example: "-created_date"
+
+  schemas:
+    # ===================== Shared =====================
+    LiteUser:
+      type: object
+      description: Minimal user representation used in created_by / updated_by fields
+      properties:
+        external_id:
+          type: string
+          format: uuid
+        first_name:
+          type: string
+        last_name:
+          type: string
+        username:
+          type: string
+
+    PaginatedMeta:
+      type: object
+      required:
+        - count
+        - results
+      properties:
+        count:
+          type: integer
+          description: Total number of records matching the query
+        next:
+          type: string
+          format: uri
+          nullable: true
+          description: URL of the next page
+        previous:
+          type: string
+          format: uri
+          nullable: true
+          description: URL of the previous page
+
+    # ===================== DICOM Studies =====================
+    DicomSeries:
+      type: object
+      description: Summary of one DICOM series within a study, fetched live from DCM4CHEE
+      properties:
+        series_uid:
+          type: string
+          description: Series Instance UID
+          example: "1.2.840.10008.5.1.4.1.1.2.456"
+        series_number:
+          type: array
+          items:
+            type: integer
+        series_instance_count:
+          type: array
+          items:
+            type: integer
+          description: Number of instances in this series
+        series_description:
+          type: array
+          items:
+            type: string
+        series_modality:
+          type: array
+          items:
+            type: string
+          example: ["CT"]
+
+    DicomStudyDetail:
+      type: object
+      description: DICOM study metadata fetched from DCM4CHEE, combined with CARE record fields
+      properties:
+        external_id:
+          type: string
+          format: uuid
+          description: CARE DicomStudy external_id
+        study_uid:
+          type: string
+          description: DICOM Study Instance UID
+          example: "1.2.840.10008.5.1.4.1.1.2.1234567890"
+        study_date:
+          type: string
+          format: date-time
+          nullable: true
+          description: Study date/time in ISO 8601 format
+          example: "2026-06-01T10:30:00"
+        study_description:
+          type: string
+          nullable: true
+          example: "CHEST PA"
+        study_modalities:
+          type: array
+          items:
+            type: string
+          description: Modality codes present in the study
+          example: ["CT"]
+        study_series:
+          type: array
+          items:
+            $ref: '#/components/schemas/DicomSeries'
+        is_archived:
+          type: boolean
+          description: Whether this study has been archived. Always false unless `includeArchived=true` was passed, since archived studies are excluded by default.
+        archive_reason:
+          type: string
+          description: Reason the study was archived. Empty string when the study is not archived.
+          example: "Duplicate upload, superseded by a later study"
+        archived_datetime:
+          type: string
+          format: date-time
+          nullable: true
+        service_request:
+          type: object
+          nullable: true
+          description: Null if this study is not linked to a service request.
+          properties:
+            id:
+              type: string
+              format: uuid
+              description: ServiceRequest external_id
+            diagnostic_report_id:
+              type: string
+              format: uuid
+              nullable: true
+              description: |
+                external_id of the most recently created DiagnosticReport for this service
+                request, or null if none exists yet.
+
+    DicomStudyArchiveRequest:
+      type: object
+      required:
+        - archive_reason
+      properties:
+        archive_reason:
+          type: string
+          minLength: 1
+          description: Reason the study is being archived
+
+    DicomStudyArchiveState:
+      type: object
+      description: DB-only view of a DicomStudy's archive state, returned by the archive action
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: DicomStudy external_id
+        dicom_study_uid:
+          type: string
+          description: DICOM Study Instance UID
+        is_archived:
+          type: boolean
+        archive_reason:
+          type: string
+        archived_datetime:
+          type: string
+          format: date-time
+          nullable: true
+        archived_by:
+          $ref: '#/components/schemas/LiteUser'
+          nullable: true
+
+    WorklistEntry:
+      type: object
+      description: A single modality worklist entry (active service request formatted for DICOM MWL)
+      properties:
+        service_request:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+              description: ServiceRequest external_id
+            name:
+              type: string
+              description: Name of the activity/procedure
+            date:
+              type: string
+              format: date-time
+        facility:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+        patient:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+              description: Patient external_id
+            name:
+              type: string
+            gender:
+              type: string
+              nullable: true
+            age:
+              type: integer
+              nullable: true
+
+    # ===================== Radiology Service Request =====================
+    RadiologyServiceRequest:
+      type: object
+      description: Radiology-specific metadata linked 1:1 to a CARE ServiceRequest
+      required:
+        - id
+        - status
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: RadiologyServiceRequest external_id
+        status:
+          type: string
+          enum: ["ACTIVE", "IN_PROGRESS", "COMPLETED", "CANCELLED"]
+        accession_number:
+          type: string
+          nullable: true
+          description: |
+            Accession number generated for this service request (also mirrored onto
+            ServiceRequest.meta.accession_number). Null until a note thread has been
+            created for the request.
+          example: "ACJAYCTO26000004"
+
+    # ===================== Webhooks =====================
+    WebhookStudyPayload:
+      type: object
+      description: |
+        One of (service_request_id + study_id), (accession_number + study_id), or
+        (patient_id + study_id) must be present.
+        Additional fields in the payload are stored verbatim in RadiologyWebhookLogs.
+      required:
+        - study_id
+      properties:
+        service_request_id:
+          type: string
+          format: uuid
+          description: CARE ServiceRequest external_id (Shape A)
+        accession_number:
+          type: string
+          description: Accession number, looked up via RadiologyServiceRequest.accession_number (Shape B)
+          example: "ACJAYCTO26000004"
+        patient_id:
+          type: string
+          description: |
+            Patient identifier as stored in Patient.instance_identifiers
+            (e.g. HIS patient ID). Used for Shape C when no service_request_id or
+            accession_number is provided.
+          example: "PID-00123"
+        study_id:
+          type: string
+          description: DICOM Study Instance UID
+          example: "1.2.840.10008.5.1.4.1.1.2.1234567890"
+      additionalProperties: true
+
+    WebhookStudyResponse:
+      type: object
+      properties:
+        detail:
+          type: string
+          example: "Webhook received and saved successfully"
+        record:
+          type: object
+          description: Created or retrieved record summary
+          properties:
+            external_id:
+              type: string
+              format: uuid
+              description: |
+                RadiologyServiceRequest external_id (Shape A/B) or DicomStudy external_id (Shape C)
+            data:
+              type: object
+              description: Raw payload that was stored
+
+    WebhookStatusPayload:
+      type: object
+      required:
+        - service_request_id
+        - study_status
+      properties:
+        service_request_id:
+          type: string
+          format: uuid
+          description: CARE ServiceRequest external_id
+        study_status:
+          type: string
+          description: |
+            MPPS status value. Expected to be one of SCAN_STARTED, SCAN_COMPLETED,
+            DISCONTINUED, but other values are still processed (with a warning logged),
+            as long as a matching facility TagConfig.display exists.
+          example: "SCAN_STARTED"
+
+    WebhookStatusResponse:
+      type: object
+      properties:
+        detail:
+          type: string
+          example: "MPPS status tag updated successfully"
+        service_request_id:
+          type: string
+          format: uuid
+        study_status:
+          type: string
+        tag_id:
+          type: integer
+          description: Internal TagConfig id (matches an entry in ServiceRequest.tags)
+        tag_uuid:
+          type: string
+          format: uuid
+          description: TagConfig external_id
+        current_tags:
+          type: array
+          items:
+            type: integer
+          description: Full tags array on the ServiceRequest after this update
+
+    # ===================== Observation Template =====================
+    ObservationTemplateField:
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          type: string
+          description: Observation component code
+        value:
+          type: string
+          nullable: true
+          description: Default/placeholder value for this field
+        description:
+          type: string
+          nullable: true
+
+    ObservationTemplateCreate:
+      type: object
+      required:
+        - facility
+        - observation_definition
+        - title
+        - fields
+      properties:
+        facility:
+          type: string
+          format: uuid
+          description: Facility external_id
+        observation_definition:
+          type: string
+          format: uuid
+          description: ObservationDefinition external_id
+        activity_definition:
+          type: string
+          format: uuid
+          nullable: true
+          description: ActivityDefinition external_id
+        title:
+          type: string
+          description: Unique per facility
+          example: "Chest X-Ray Findings"
+        description:
+          type: string
+          nullable: true
+        fields:
+          type: array
+          minItems: 1
+          description: At least one field is required; replaces all existing fields on create
+          items:
+            $ref: '#/components/schemas/ObservationTemplateField'
+
+    ObservationTemplateUpdate:
+      type: object
+      description: All fields optional; only supplied fields are updated. `fields` cannot be changed via update.
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+          nullable: true
+
+    ObservationTemplate:
+      type: object
+      required:
+        - id
+        - facility
+        - observation_definition
+        - title
+        - fields
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        facility:
+          type: string
+          format: uuid
+          description: Facility external_id
+        observation_definition:
+          type: string
+          format: uuid
+          description: ObservationDefinition external_id
+        activity_definition:
+          type: string
+          format: uuid
+          nullable: true
+          description: ActivityDefinition external_id
+        title:
+          type: string
+        description:
+          type: string
+          nullable: true
+        fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObservationTemplateField'
+
+    ObservationTemplateList:
+      allOf:
+        - $ref: '#/components/schemas/PaginatedMeta'
+        - type: object
+          properties:
+            results:
+              type: array
+              items:
+                $ref: '#/components/schemas/ObservationTemplate'
+
+    # ===================== Error =====================
+    ErrorEnvelope:
+      type: object
+      description: |
+        Envelope produced by core CARE's `emr_exception_handler`. Used by every endpoint in
+        this plugin for `Http404`, DRF `ValidationError` and pydantic `ValidationError`.
+        `403` / `401` fall through to DRF's default `{"detail": ...}`.
+      properties:
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                description: '`object_not_found`, `validation_error`, or a pydantic error type such as `missing`'
+                example: "object_not_found"
+              loc:
+                type: array
+                description: Field path (pydantic errors only)
+                items:
+                  type: string
+              msg:
+                description: Human-readable message; an object for DRF field errors
+                oneOf:
+                  - type: string
+                  - type: object
+            additionalProperties: true
+
+    Error:
+      type: object
+      description: |
+        DRF's default body, used only for `401` and `403`, which bypass
+        `emr_exception_handler`. Everything else uses `ErrorEnvelope`.
+      properties:
+        detail:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Bad Request — invalid input
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            errors:
+              - type: "missing"
+                loc: ["title"]
+                msg: "Field required"
+
+    Unauthorized:
+      description: Unauthorized — missing or invalid authentication
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            detail: "Authentication credentials were not provided"
+
+    Forbidden:
+      description: Forbidden — authenticated but not permitted
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            detail: "You do not have permission to perform this action"
+
+    NotFound:
+      description: Not Found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            errors:
+              - type: "object_not_found"
+                msg: "No ServiceRequest matches the given query."
+
+    InternalServerError:
+      description: Internal Server Error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            errors:
+              - type: "dicom_upload_error"
+                msg: "Upload succeeded but failed to fetch complete study details from DCM4CHE"
